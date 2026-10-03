@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<title>CivicSpot — Clean streets, together</title>
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+  // Custom palette grounded in municipal signage: ink, a civic teal, warm paper,
+  // and three functional status hues (kept far from the brand teal so they never read as "just another accent").
+  tailwind.config = { theme: { extend: { colors: {
+    ink:   '#16232B',
+    paper: '#F7F4ED',
+    civic: {50:'#EAF3F2',100:'#CFE4E1',500:'#2A7A75',600:'#1F6F6B',700:'#195A57'},
+    clean: '#3F9142',
+    attention: '#C98A2C',
+    urgent: '#B23A2E'
+  } } } }
+</script>
+
+<style>
+  * { -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; overscroll-behavior: none; background: #F7F4ED; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  ::-webkit-scrollbar { display: none; }
+
+  #map { position: fixed; inset: 0; z-index: 0; background: #EDE8DA; }
+  /* Two common Tailwind/Leaflet collisions: Tailwind's preflight shrinks <img>, and our
+     bottom nav sits where Leaflet parks its attribution control. Fix both explicitly. */
+  .leaflet-container img { max-width: none !important; }
+  .leaflet-control-attribution { font-size: 8px !important; opacity: .75; }
+  .leaflet-bottom.leaflet-right { bottom: calc(58px + env(safe-area-inset-bottom, 0px)) !important; }
+
+  .safe-t { padding-top: env(safe-area-inset-top, 0px); }
+  .safe-b { padding-bottom: env(safe-area-inset-bottom, 0px); }
+
+  .marker-pin { position: relative; width: 38px; height: 38px; border-radius: 50%; display: flex;
+    align-items: center; justify-content: center; border: 3px solid #F7F4ED; box-shadow: 0 3px 10px rgba(0,0,0,.35); }
+  .marker-pin svg { width: 19px; height: 19px; }
+  .marker-pin.pulse::after { content: ''; position: absolute; inset: -5px; border-radius: 50%;
+    border: 2.5px solid #B23A2E; animation: pulseRing 1.5s ease-out infinite; }
+  @keyframes pulseRing { 0% { transform: scale(.7); opacity: .9; } 100% { transform: scale(1.9); opacity: 0; } }
+
+  .drawer, .modal-panel { transition: transform .28s cubic-bezier(.4,0,.2,1), opacity .28s ease; }
+  #toast { transition: none; }
+  .toast-anim { animation: toastPop 2.2s ease forwards; }
+  @keyframes toastPop {
+    0% { transform: translate(-50%,-16px); opacity: 0; }
+    12% { transform: translate(-50%,0); opacity: 1; }
+    85% { transform: translate(-50%,0); opacity: 1; }
+    100% { transform: translate(-50%,-10px); opacity: 0; }
+  }
+  .opt-btn.active { outline: 2px solid #1F6F6B; outline-offset: 2px; background: #EAF3F2; }
+</style>
+</head>
+<body class="text-ink">
+
+<div id="map"></div>
+
+<!-- Top filter bar -->
+<div class="safe-t fixed top-0 inset-x-0 z-30 px-3 pt-3">
+  <div class="bg-paper/95 backdrop-blur-md rounded-2xl shadow-lg px-3 py-2.5 flex items-center gap-2 border border-black/5">
+    <div id="filterType" class="flex bg-black/5 rounded-xl p-1 flex-1 text-sm font-medium">
+      <button data-t="all" onclick="setTypeFilter('all')" class="flex-1 py-1.5 rounded-lg bg-civic-600 text-white transition">All</button>
+      <button data-t="dustbin" onclick="setTypeFilter('dustbin')" class="flex-1 py-1.5 rounded-lg text-ink/60 transition">Bins</button>
+      <button data-t="washroom" onclick="setTypeFilter('washroom')" class="flex-1 py-1.5 rounded-lg text-ink/60 transition">Washrooms</button>
+    </div>
+    <button id="bountyToggle" onclick="toggleBountyFilter()" class="shrink-0 w-10 h-10 rounded-xl bg-black/5 text-ink/50 text-lg flex items-center justify-center" title="Only active bounties">🔥</button>
+  </div>
+</div>
+
+<!-- Placement mode: crosshair + confirm bar -->
+<div id="crosshair" class="hidden fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-full z-20 pointer-events-none drop-shadow-lg">
+  <svg width="42" height="42" viewBox="0 0 24 24" fill="#1F6F6B" stroke="#F7F4ED" stroke-width="1"><path d="M12 2C7.6 2 4 5.6 4 10c0 6 8 12 8 12s8-6 8-12c0-4.4-3.6-8-8-8zm0 11a3 3 0 110-6 3 3 0 010 6z"/></svg>
+</div>
+<div id="placementBar" class="hidden fixed bottom-0 inset-x-0 z-30 safe-b bg-paper border-t border-black/10 p-4 flex gap-3">
+  <button onclick="cancelPlacement()" class="flex-1 py-3 rounded-xl bg-black/5 font-semibold text-ink/70">Cancel</button>
+  <button onclick="confirmPlacement()" class="flex-1 py-3 rounded-xl bg-civic-600 text-white font-semibold shadow-md">Drop pin here</button>
+</div>
+
+<!-- Add button -->
+<button id="fab" onclick="startPlacement()" aria-label="Add amenity"
+  class="fixed right-4 bottom-24 z-30 w-14 h-14 rounded-full bg-civic-600 text-white shadow-xl flex items-center justify-center text-3xl font-light active:scale-95 transition">+</button>
+
+<!-- Bottom nav -->
+<div class="safe-b fixed bottom-0 inset-x-0 z-30 bg-paper border-t border-black/10 flex">
+  <button onclick="closeAllPanels()" class="flex-1 py-2.5 flex flex-col items-center gap-0.5 text-civic-700">
+    <span class="text-xl">🗺️</span><span class="text-[11px] font-medium">Map</span>
+  </button>
+  <button onclick="openLeaderboard()" class="flex-1 py-2.5 flex flex-col items-center gap-0.5 text-ink/50">
+    <span class="text-xl">🏆</span><span class="text-[11px] font-medium">Leaderboard</span>
+  </button>
+  <button onclick="openProfile()" class="flex-1 py-2.5 flex flex-col items-center gap-0.5 text-ink/50">
+    <span class="text-xl">👤</span><span class="text-[11px] font-medium">Profile</span>
+  </button>
+</div>
+
+<!-- Bottom drawer: amenity details -->
+<div id="drawer" class="drawer translate-y-full fixed bottom-0 inset-x-0 z-40 bg-paper rounded-t-[28px] shadow-2xl max-h-[70vh] overflow-y-auto pb-6">
+  <div class="flex justify-center pt-2.5 pb-1"><div class="w-10 h-1.5 bg-ink/15 rounded-full"></div></div>
+  <div id="drawerContent" class="px-5"></div>
+</div>
+
+<!-- Add amenity modal -->
+<div id="addModal" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-ink/40" onclick="if(event.target===this)closeAddModal()">
+  <div class="modal-panel bg-paper rounded-t-[28px] sm:rounded-[28px] w-full sm:max-w-sm p-6 pb-8">
+    <div class="flex justify-between items-center mb-4">
+      <h2 class="text-lg font-bold">Add an amenity</h2>
+      <button onclick="closeAddModal()" class="text-ink/40 text-2xl leading-none" aria-label="Close">&times;</button>
+    </div>
+    <p class="text-sm text-ink/60 mb-2 font-medium">Type</p>
+    <div id="addType" class="grid grid-cols-2 gap-3 mb-4">
+      <button data-type="dustbin" onclick="selectOption(this.parentElement,this)" class="opt-btn active border border-black/10 rounded-xl py-3 flex flex-col items-center gap-1">
+        <span class="text-2xl">🗑️</span><span class="text-sm font-medium">Dustbin</span>
+      </button>
+      <button data-type="washroom" onclick="selectOption(this.parentElement,this)" class="opt-btn border border-black/10 rounded-xl py-3 flex flex-col items-center gap-1">
+        <span class="text-2xl">🚻</span><span class="text-sm font-medium">Washroom</span>
+      </button>
+    </div>
+    <p class="text-sm text-ink/60 mb-2 font-medium">Condition right now</p>
+    <div id="addStatus" class="grid grid-cols-3 gap-2 mb-6">
+      <button data-status="clean" onclick="selectOption(this.parentElement,this)" class="opt-btn active border border-black/10 rounded-xl py-2 text-sm font-medium">Clean</button>
+      <button data-status="moderate" onclick="selectOption(this.parentElement,this)" class="opt-btn border border-black/10 rounded-xl py-2 text-sm font-medium">Moderate</button>
+      <button data-status="full" onclick="selectOption(this.parentElement,this)" class="opt-btn border border-black/10 rounded-xl py-2 text-sm font-medium">Full</button>
+    </div>
+    <button onclick="submitAdd()" class="w-full py-3.5 rounded-xl bg-civic-600 text-white font-semibold shadow-md">Add amenity (+50 XP)</button>
+  </div>
+</div>
+
+<!-- Leaderboard modal -->
+<div id="leaderModal" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-ink/40" onclick="if(event.target===this)closeModal('leaderModal')">
+  <div class="modal-panel bg-paper rounded-t-[28px] sm:rounded-[28px] w-full sm:max-w-sm max-h-[75vh] flex flex-col">
+    <div class="flex justify-between items-center p-5 pb-3">
+      <h2 class="text-lg font-bold">🏆 Local leaderboard</h2>
+      <button onclick="closeModal('leaderModal')" class="text-ink/40 text-2xl leading-none" aria-label="Close">&times;</button>
+    </div>
+    <div id="leaderList" class="overflow-y-auto pb-4"></div>
+  </div>
+</div>
+
+<!-- Profile modal -->
+<div id="profileModal" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-ink/40" onclick="if(event.target===this)closeModal('profileModal')">
+  <div class="modal-panel bg-paper rounded-t-[28px] sm:rounded-[28px] w-full sm:max-w-sm p-6 pb-8">
+    <div class="flex justify-between items-center mb-5">
+      <h2 class="text-lg font-bold">Your profile</h2>
+      <button onclick="closeModal('profileModal')" class="text-ink/40 text-2xl leading-none" aria-label="Close">&times;</button>
+    </div>
+    <div class="text-center mb-5">
+      <div class="text-3xl font-extrabold text-civic-700" id="profXp">0</div>
+      <div class="text-sm text-ink/50">Total XP</div>
+      <div class="mt-2 inline-block px-3 py-1 rounded-full bg-civic-50 text-civic-700 font-semibold text-sm" id="profRank">Civic Scout</div>
+    </div>
+    <div class="w-full h-2.5 bg-black/5 rounded-full overflow-hidden mb-1.5">
+      <div id="profBar" class="h-full bg-civic-500 rounded-full transition-all" style="width:0%"></div>
+    </div>
+    <div class="text-xs text-ink/40 mb-5" id="profNext">—</div>
+    <div class="grid grid-cols-3 gap-2 text-center">
+      <div class="bg-black/[0.03] rounded-xl py-3"><div class="text-lg font-bold" id="profAdded">0</div><div class="text-[11px] text-ink/50">Added</div></div>
+      <div class="bg-black/[0.03] rounded-xl py-3"><div class="text-lg font-bold" id="profReports">0</div><div class="text-[11px] text-ink/50">Reports</div></div>
+      <div class="bg-black/[0.03] rounded-xl py-3"><div class="text-lg font-bold" id="profVerifs">0</div><div class="text-[11px] text-ink/50">Verified</div></div>
+    </div>
+    <button onclick="if(confirm('Reset all local demo data? This clears your XP and any pins you added.'))resetData()" class="w-full mt-5 text-xs text-ink/40 underline">Reset demo data</button>
+  </div>
+</div>
+
+<!-- XP toast -->
+<div id="toast" class="hidden fixed top-20 left-1/2 z-50 bg-ink text-paper text-sm font-semibold px-4 py-2.5 rounded-full shadow-xl"></div>
+
+<!-- Empty-state banner -->
+<div id="emptyBanner" class="hidden fixed top-24 left-1/2 -translate-x-1/2 z-20 bg-paper/95 shadow-md rounded-full px-4 py-2 text-xs text-ink/60 font-medium">No results for this filter</div>
+
+<script>
+/* =====================================================================
+   CivicSpot — crowdsourced dustbin & washroom map
+   Single-file demo: Leaflet/OpenStreetMap + Tailwind + vanilla JS.
+   Data lives in localStorage on this device only — there's no shared
+   backend here, so "crowdsourcing" across real users would need one
+   (e.g. Firebase/Supabase) to sync amenities and reports centrally.
+   ===================================================================== */
+
+// ---------- Constants ----------
+const STATUS_COLOR = { clean: '#3F9142', moderate: '#C98A2C', full: '#B23A2E' };
+const STATUS_LABEL = { clean: 'Clean', moderate: 'Needs attention', full: 'Full / dirty' };
+const RANKS = [
+  { name: 'Civic Scout', min: 0 },
+  { name: 'Neighborhood Ranger', min: 150 },
+  { name: 'Urban Guardian', min: 400 },
+  { name: 'City Champion', min: 800 }
+];
+const XPV = { add: 50, report: 15, verify: 30 };
+const DEFAULT_CENTER = { lat: 13.151040, lng: 77.610017 }; // fallback if GPS is unavailable — Sir MVIT, Bangalore
+
+const DUSTBIN_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="M6 7l1 13a2 2 0 002 2h6a2 2 0 002-2l1-13"/><path d="M10 11v6M14 11v6"/></svg>`;
+const WASHROOM_SVG = `<svg viewBox="0 0 24 24" fill="#fff"><circle cx="12" cy="5" r="2.4"/><path d="M8.2 21l1.3-8.2H7.4l1.8-5.6h5.6l1.8 5.6h-2.1L15.8 21h-2.3l-.7-5.6h-1.6l-.7 5.6z"/></svg>`;
+const MOCK_LEADERS = [
+  { name: 'Asha K.', xp: 620 }, { name: 'Ravi T.', xp: 540 }, { name: 'Priya M.', xp: 410 },
+  { name: 'Dev S.', xp: 275 }, { name: 'Meera J.', xp: 190 }, { name: 'Karan V.', xp: 95 }
+];
+
+// ---------- State ----------
+let state = null;          // { user:{xp,reports,verifications,added}, amenities:[...] }
+let map, markerLayer;
+let userPos = null;
+let placementPos = null;
+let filters = { type: 'all', bountyOnly: false };
+
+// ---------- Persistence ----------
+function loadState() {
+  try { const raw = localStorage.getItem('civicspot_v2'); return raw ? JSON.parse(raw) : null; }
+  catch (e) { return null; }
+}
+function saveState() { localStorage.setItem('civicspot_v2', JSON.stringify(state)); }
+function resetData() { localStorage.removeItem('civicspot_v2'); location.reload(); }
+
+function seedAmenities(center) {
+  const off = (dx, dy) => ({ lat: center.lat + dy / 111000, lng: center.lng + dx / (111000 * Math.cos(center.lat * Math.PI / 180)) });
+  const t = Date.now();
+  return [
+    { id: 's1', type: 'dustbin',  status: 'clean',    ...off(120, 80),   bounty: false, confirm: 0, dispute: 0, reason: '',               updated: t - 3600e3  },
+    { id: 's2', type: 'dustbin',  status: 'full',      ...off(-220, 160), bounty: true,  confirm: 0, dispute: 0, reason: 'Overflowing',    updated: t - 1800e3  },
+    { id: 's3', type: 'dustbin',  status: 'moderate', ...off(300, -110), bounty: false, confirm: 0, dispute: 0, reason: '',               updated: t - 7200e3  },
+    { id: 's4', type: 'washroom', status: 'clean',    ...off(-160, -210),bounty: false, confirm: 0, dispute: 0, reason: '',               updated: t - 5400e3  },
+    { id: 's5', type: 'washroom', status: 'full',      ...off(260, 230),  bounty: true,  confirm: 0, dispute: 0, reason: 'Dirty',          updated: t - 900e3   },
+    { id: 's6', type: 'washroom', status: 'moderate', ...off(-310, 60),  bounty: false, confirm: 0, dispute: 0, reason: '',               updated: t - 10800e3 },
+    { id: 's7', type: 'dustbin',  status: 'clean',    ...off(60, -260),  bounty: false, confirm: 0, dispute: 0, reason: '',               updated: t - 2400e3  }
+  ];
+}
+
+// ---------- Init ----------
+function init() {
+  state = loadState();
+  if (navigator.geolocation) {
+    navigator.geolocation.getCurrentPosition(
+      p => boot(p.coords.latitude, p.coords.longitude),
+      () => boot(DEFAULT_CENTER.lat, DEFAULT_CENTER.lng),
+      { timeout: 6000 }
+    );
+  } else boot(DEFAULT_CENTER.lat, DEFAULT_CENTER.lng);
+}
+
+function boot(lat, lng) {
+  userPos = { lat, lng };
+  if (!state) { state = { user: { xp: 0, reports: 0, verifications: 0, added: 0 }, amenities: seedAmenities(userPos) }; saveState(); }
+
+  map = L.map('map', { zoomControl: false }).setView([lat, lng], 16);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+  markerLayer = L.layerGroup().addTo(map);
+  L.circleMarker([lat, lng], { radius: 8, color: '#F7F4ED', weight: 3, fillColor: '#1F6F6B', fillOpacity: 1 })
+    .addTo(map).bindTooltip('You are here');
+
+  renderMarkers();
+  updateProfileUI();
+}
+
+// ---------- Markers ----------
+function makeIcon(type, status) {
+  const svg = type === 'dustbin' ? DUSTBIN_SVG : WASHROOM_SVG;
+  const cls = status === 'full' ? 'marker-pin pulse' : 'marker-pin';
+  return L.divIcon({ className: '', html: `<div class="${cls}" style="background:${STATUS_COLOR[status]}">${svg}</div>`, iconSize: [38, 38], iconAnchor: [19, 19] });
+}
+function renderMarkers() {
+  markerLayer.clearLayers();
+  const list = state.amenities.filter(a => (filters.type === 'all' || a.type === filters.type) && (!filters.bountyOnly || a.bounty));
+  list.forEach(a => {
+    const m = L.marker([a.lat, a.lng], { icon: makeIcon(a.type, a.status) });
+    m.on('click', () => openDrawer(a.id));
+    m.addTo(markerLayer);
+  });
+  document.getElementById('emptyBanner').classList.toggle('hidden', list.length > 0);
+}
+
+// ---------- Helpers ----------
+function distanceMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000, toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+function timeAgo(ts) {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+function getRankInfo(xp) {
+  let cur = RANKS[0], nxt = RANKS[1];
+  for (let i = 0; i < RANKS.length; i++) if (xp >= RANKS[i].min) { cur = RANKS[i]; nxt = RANKS[i + 1] || null; }
+  const pct = nxt ? Math.min(100, Math.round((xp - cur.min) / (nxt.min - cur.min) * 100)) : 100;
+  return { cur, nxt, pct };
+}
+
+// ---------- Drawer ----------
+function openDrawer(id) {
+  const a = state.amenities.find(x => x.id === id); if (!a) return;
+  const dist = userPos ? Math.round(distanceMeters(userPos.lat, userPos.lng, a.lat, a.lng)) : null;
+  const badgeColor = a.status === 'clean' ? 'bg-clean/10 text-clean' : a.status === 'moderate' ? 'bg-attention/10 text-attention' : 'bg-urgent/10 text-urgent';
+  const typeLabel = a.type === 'dustbin' ? 'Dustbin' : 'Public washroom';
+
+  const reportBtns = a.type === 'dustbin'
+    ? `<button onclick="reportStatus('${a.id}','full','Overflowing')" class="flex-1 py-2.5 rounded-xl bg-urgent/10 text-urgent text-sm font-semibold">Report full</button>
+       <button onclick="reportStatus('${a.id}','moderate','Needs maintenance')" class="flex-1 py-2.5 rounded-xl bg-attention/10 text-attention text-sm font-semibold">Needs maintenance</button>`
+    : `<button onclick="reportStatus('${a.id}','full','Dirty')" class="flex-1 py-2.5 rounded-xl bg-urgent/10 text-urgent text-sm font-semibold">Report dirty</button>
+       <button onclick="reportStatus('${a.id}','moderate','Needs maintenance')" class="flex-1 py-2.5 rounded-xl bg-attention/10 text-attention text-sm font-semibold">Needs maintenance</button>`;
+
+  const bountyBlock = a.bounty ? `
+    <div class="mt-4 p-3.5 rounded-xl bg-urgent/5 border border-urgent/15">
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-urgent font-bold text-sm">🔥 Active bounty</span>
+        <span class="text-xs text-urgent/70 font-medium">${a.confirm}/2 confirmations</span>
+      </div>
+      <p class="text-xs text-urgent/80 mb-3">Nearby? Help confirm whether this report is accurate.</p>
+      <div class="flex gap-2">
+        <button onclick="verifyBounty('${a.id}',true)" class="flex-1 py-2 rounded-lg bg-urgent text-white text-sm font-semibold">Verify</button>
+        <button onclick="verifyBounty('${a.id}',false)" class="flex-1 py-2 rounded-lg bg-white border border-urgent/25 text-urgent text-sm font-semibold">Dispute</button>
+      </div>
+    </div>` : '';
+
+  document.getElementById('drawerContent').innerHTML = `
+    <div class="flex items-start justify-between mb-1">
+      <div>
+        <h3 class="text-lg font-bold">${typeLabel}</h3>
+        <p class="text-xs text-ink/45">${dist !== null ? dist + 'm away, ' : ''}updated ${timeAgo(a.updated)}</p>
+      </div>
+      <span class="px-2.5 py-1 rounded-full text-xs font-bold ${badgeColor}">${STATUS_LABEL[a.status]}</span>
+    </div>
+    ${a.reason ? `<p class="text-sm text-ink/60 mt-1">Reason noted: ${a.reason}</p>` : ''}
+    <div class="flex gap-2 mt-4">${reportBtns}</div>
+    ${bountyBlock}
+  `;
+  document.getElementById('drawer').classList.remove('translate-y-full');
+}
+function closeDrawer() { document.getElementById('drawer').classList.add('translate-y-full'); }
+
+// ---------- Core actions (each awards XP, per the spec) ----------
+function reportStatus(id, status, reason) {
+  const a = state.amenities.find(x => x.id === id); if (!a) return;
+  a.status = status; a.reason = reason; a.updated = Date.now();
+  if (status === 'full') { a.bounty = true; a.confirm = 0; a.dispute = 0; }
+  state.user.xp += XPV.report; state.user.reports++;
+  saveState(); renderMarkers(); openDrawer(id); updateProfileUI();
+  toast(`+${XPV.report} XP Earned!`);
+}
+function verifyBounty(id, ok) {
+  const a = state.amenities.find(x => x.id === id); if (!a || !a.bounty) return;
+  ok ? a.confirm++ : a.dispute++;
+  state.user.xp += XPV.verify; state.user.verifications++;
+  if (a.confirm >= 2) a.bounty = false;
+  if (a.dispute >= 2) { a.bounty = false; a.status = 'clean'; a.confirm = 0; a.dispute = 0; a.reason = ''; }
+  saveState(); renderMarkers(); openDrawer(id); updateProfileUI();
+  toast(`+${XPV.verify} XP Earned!`);
+}
+function submitAdd() {
+  const type = document.querySelector('#addType .active').dataset.type;
+  const status = document.querySelector('#addStatus .active').dataset.status;
+  const pos = placementPos || userPos;
+  const id = 'u' + Date.now();
+  state.amenities.push({ id, type, status, lat: pos.lat, lng: pos.lng, bounty: status === 'full', confirm: 0, dispute: 0, reason: status === 'full' ? 'Reported at creation' : '', updated: Date.now() });
+  state.user.xp += XPV.add; state.user.added++;
+  saveState(); renderMarkers(); closeAddModal(); updateProfileUI();
+  toast(`+${XPV.add} XP Earned!`);
+}
+
+// ---------- Placement mode (drop a pin at the map's center, then confirm) ----------
+function startPlacement() {
+  if (!state) return;
+  document.getElementById('crosshair').classList.remove('hidden');
+  document.getElementById('placementBar').classList.remove('hidden');
+  document.getElementById('fab').classList.add('hidden');
+  closeDrawer();
+}
+function confirmPlacement() {
+  const c = map.getCenter();
+  placementPos = { lat: c.lat, lng: c.lng };
+  endPlacement(); openAddModal();
+}
+function cancelPlacement() { endPlacement(); }
+function endPlacement() {
+  document.getElementById('crosshair').classList.add('hidden');
+  document.getElementById('placementBar').classList.add('hidden');
+  document.getElementById('fab').classList.remove('hidden');
+}
+
+// ---------- UI helpers ----------
+function selectOption(container, btn) {
+  container.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+}
+function openAddModal() { document.getElementById('addModal').classList.remove('hidden'); }
+function closeAddModal() { document.getElementById('addModal').classList.add('hidden'); placementPos = null; }
+function openLeaderboard() { if (!state) return; renderLeaderboard(); document.getElementById('leaderModal').classList.remove('hidden'); }
+function openProfile() { if (!state) return; updateProfileUI(); document.getElementById('profileModal').classList.remove('hidden'); }
+function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
+function closeAllPanels() { closeDrawer(); ['addModal', 'leaderModal', 'profileModal'].forEach(closeModal); cancelPlacement(); }
+
+function setTypeFilter(t) {
+  filters.type = t; renderMarkers();
+  document.querySelectorAll('#filterType button').forEach(b => {
+    const on = b.dataset.t === t;
+    b.classList.toggle('bg-civic-600', on); b.classList.toggle('text-white', on); b.classList.toggle('text-ink/60', !on);
+  });
+}
+function toggleBountyFilter() {
+  filters.bountyOnly = !filters.bountyOnly; renderMarkers();
+  const b = document.getElementById('bountyToggle');
+  b.classList.toggle('bg-urgent', filters.bountyOnly); b.classList.toggle('text-white', filters.bountyOnly); b.classList.toggle('bg-black/5', !filters.bountyOnly);
+}
+
+function renderLeaderboard() {
+  const list = [...MOCK_LEADERS, { name: 'You', xp: state.user.xp, me: true }].sort((a, b) => b.xp - a.xp);
+  document.getElementById('leaderList').innerHTML = list.map((u, i) => `
+    <div class="flex items-center gap-3 px-5 py-3 ${u.me ? 'bg-civic-50' : ''} ${i < list.length - 1 ? 'border-b border-black/5' : ''}">
+      <div class="w-7 h-7 flex items-center justify-center rounded-full ${i < 3 ? 'bg-attention text-white' : 'bg-black/5 text-ink/50'} text-xs font-bold">${i + 1}</div>
+      <div class="flex-1 font-medium ${u.me ? 'text-civic-700' : 'text-ink/80'}">${u.name}${u.me ? ' (you)' : ''}</div>
+      <div class="text-sm font-semibold text-ink/50">${u.xp} XP</div>
+    </div>`).join('');
+}
+
+function updateProfileUI() {
+  if (!state) return;
+  const { cur, nxt, pct } = getRankInfo(state.user.xp);
+  document.getElementById('profXp').textContent = state.user.xp;
+  document.getElementById('profRank').textContent = cur.name;
+  document.getElementById('profNext').textContent = nxt ? `${nxt.min - state.user.xp} XP to ${nxt.name}` : 'Max rank reached!';
+  document.getElementById('profBar').style.width = pct + '%';
+  document.getElementById('profAdded').textContent = state.user.added;
+  document.getElementById('profReports').textContent = state.user.reports;
+  document.getElementById('profVerifs').textContent = state.user.verifications;
+}
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.remove('hidden', 'toast-anim'); void t.offsetWidth; t.classList.add('toast-anim');
+  clearTimeout(window._toastTimer);
+  window._toastTimer = setTimeout(() => t.classList.add('hidden'), 2200);
+}
+
+init();
+</script>
+</body>
+</html>
